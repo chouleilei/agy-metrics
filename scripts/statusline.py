@@ -342,6 +342,19 @@ def main() -> None:
         ]
         if sub_cache_pct is not None:
             sub_parts.append(f"缓存 {GREEN}{sub_cache_pct:.1f}%{RESET}")
+
+        sub_last_tps = sub_agg.get("last_tps")
+        sub_last_el = sub_agg.get("last_elapsed")
+        sub_avg_tps = sub_agg.get("avg_tps")
+        if sub_last_tps is not None and sub_avg_tps is not None:
+            sub_parts.append(
+                f"速度 {YELLOW}{sub_last_tps:.1f}{RESET}{DIM}({sub_last_el:.1f}s){RESET}/平均{YELLOW}{sub_avg_tps:.1f}{RESET} tok/s"
+            )
+        elif sub_avg_tps is not None:
+            sub_parts.append(f"平均 {YELLOW}{sub_avg_tps:.1f}{RESET} tok/s")
+        else:
+            sub_parts.append(f"速度 {DIM}--{RESET}")
+
         if sub_cost > 0:
             sub_parts.append(f"{DIM}{format_cost_str(sub_cost)}{RESET}")
 

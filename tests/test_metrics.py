@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -287,6 +288,29 @@ class TestEndToEndScripts(unittest.TestCase):
         conn.commit()
         conn.close()
 
+        (self.cache / f"{child_id}.json").write_text(
+            json.dumps({
+                "cum_out": 1000,
+                "cum_elapsed": 20.0,
+                "cum_tps": 50.0,
+                "last_tps": 25.0,
+                "last_elapsed": 4.0,
+                "last_updated": 100.0,
+            }),
+            encoding="utf-8",
+        )
+        (self.cache / f"{grandchild_id}.json").write_text(
+            json.dumps({
+                "cum_out": 300,
+                "cum_elapsed": 6.0,
+                "cum_tps": 50.0,
+                "last_tps": 30.0,
+                "last_elapsed": 2.0,
+                "last_updated": 200.0,
+            }),
+            encoding="utf-8",
+        )
+
         r_sl = subprocess.run(
             [sys.executable, str(SCRIPTS_DIR / "statusline.py")],
             input=json.dumps({
@@ -307,9 +331,11 @@ class TestEndToEndScripts(unittest.TestCase):
         self.assertIn("Out:500", lines[0])
         # Line 2: subagent summary + combined total
         self.assertIn("↳ 子代理(2个·research×1,self×1/2步)", lines[1])
-        self.assertIn("In:120.0k", lines[1])
-        self.assertIn("Out:1.30k", lines[1])
-        self.assertIn("总计", lines[1])
+        plain_line2 = re.sub(r"\x1b\[[0-9;]*m", "", lines[1])
+        self.assertIn("In:120.0k", plain_line2)
+        self.assertIn("Out:1.30k", plain_line2)
+        self.assertIn("速度 30.0(2.0s)/平均50.0 tok/s", plain_line2)
+        self.assertIn("总计", plain_line2)
         self.assertIn("In:220.0k", lines[1])
         self.assertIn("Out:1.80k", lines[1])
 

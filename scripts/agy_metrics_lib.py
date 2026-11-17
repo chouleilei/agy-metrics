@@ -516,7 +516,7 @@ def get_descendant_conversation_ids(root_session_id: str) -> list[str]:
 
 
 def read_subagent_aggregates(root_session_id: str) -> dict:
-    """Incrementally aggregate transcript stats across all descendant subagents."""
+    """Incrementally aggregate transcript stats and hook timings across all descendant subagents."""
     agg = {
         "sub_count": 0,
         "turns": 0,
@@ -525,7 +525,13 @@ def read_subagent_aggregates(root_session_id: str) -> dict:
         "output_tokens": 0,
         "est_cost_usd": 0.0,
         "roles": {},
+        "timed_out": 0,
+        "timed_elapsed": 0.0,
+        "avg_tps": None,
+        "last_tps": None,
+        "last_elapsed": None,
     }
+    latest_updated = -1.0
     descendants, agent_names = _query_descendant_tree(root_session_id)
     for sub_id in descendants:
         sub_path = find_transcript_path(sub_id)
@@ -544,4 +550,19 @@ def read_subagent_aggregates(root_session_id: str) -> dict:
         role = agent_names.get(sub_id) or ""
         if role:
             agg["roles"][role] = agg["roles"].get(role, 0) + 1
+
+        t_cache = load_json_safe(CACHE_DIR / f"{safe_id(sub_id)}.json")
+        c_out = int(t_cache.get("cum_out") or 0)
+        c_el = float(t_cache.get("cum_elapsed") or 0.0)
+        if c_out > 0 and c_el > 0:
+            agg["timed_out"] += c_out
+            agg["timed_elapsed"] += c_el
+        l_upd = float(t_cache.get("last_updated") or 0.0)
+        if t_cache.get("last_tps") is not None and l_upd >= latest_updated:
+            latest_updated = l_upd
+            agg["last_tps"] = float(t_cache["last_tps"])
+            agg["last_elapsed"] = float(t_cache.get("last_elapsed") or 0.0)
+
+    if agg["timed_elapsed"] > 0 and agg["timed_out"] > 0:
+        agg["avg_tps"] = round(agg["timed_out"] / agg["timed_elapsed"], 2)
     return agg
