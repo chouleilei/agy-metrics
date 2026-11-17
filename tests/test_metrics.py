@@ -272,15 +272,16 @@ class TestEndToEndScripts(unittest.TestCase):
         conn = sqlite3.connect(db_path)
         conn.execute(
             "CREATE TABLE conversation_summaries ("
-            "conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT, parent_conversation_id TEXT)"
+            "conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT, "
+            "parent_conversation_id TEXT, agent_name TEXT)"
         )
         ws_json = json.dumps(["file:///root/agy-metrics"])
         conn.executemany(
-            "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?)",
+            "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?)",
             [
-                (root_id, "主编排任务", ws_json, ""),
-                (child_id, "", ws_json, root_id),
-                (grandchild_id, "", ws_json, child_id),
+                (root_id, "主编排任务", ws_json, "", ""),
+                (child_id, "", ws_json, root_id, "research"),
+                (grandchild_id, "", ws_json, child_id, "self"),
             ],
         )
         conn.commit()
@@ -298,11 +299,19 @@ class TestEndToEndScripts(unittest.TestCase):
             env=self.env,
             check=True,
         )
-        out = r_sl.stdout
-        self.assertIn("1轮3步+2子代理", out)
-        # Total In: (10k+90k) + (20k+80k) + (5k+15k) = 220k; Total Out: 500+1000+300 = 1800 -> 1.80k
-        self.assertIn("In:220.0k", out)
-        self.assertIn("Out:1.80k", out)
+        lines = r_sl.stdout.strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        # Line 1: main session only
+        self.assertIn("1轮1步", lines[0])
+        self.assertIn("In:100.0k", lines[0])
+        self.assertIn("Out:500", lines[0])
+        # Line 2: subagent summary + combined total
+        self.assertIn("↳ 子代理(2个·research×1,self×1/2步)", lines[1])
+        self.assertIn("In:120.0k", lines[1])
+        self.assertIn("Out:1.30k", lines[1])
+        self.assertIn("总计", lines[1])
+        self.assertIn("In:220.0k", lines[1])
+        self.assertIn("Out:1.80k", lines[1])
 
         r_stats = subprocess.run(
             [sys.executable, str(SCRIPTS_DIR / "agy-stats"), "--json"],

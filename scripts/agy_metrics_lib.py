@@ -448,21 +448,33 @@ def load_conversation_metadata() -> dict[str, dict]:
     return meta
 
 
-def get_descendant_conversation_ids(root_session_id: str) -> list[str]:
-    """Recursively find all descendant subagent conversation IDs from conversation_summaries.db."""
+def _query_descendant_tree(root_session_id: str) -> tuple[list[str], dict[str, str]]:
+    """Return (descendant_ids, agent_names_by_id) from conversation_summaries.db."""
     if not root_session_id or not SUMMARIES_DB.is_file():
-        return []
+        return [], {}
 
     children_map: dict[str, list[str]] = {}
+    agent_names: dict[str, str] = {}
     conn = None
     try:
         conn = sqlite3.connect(f"file:{SUMMARIES_DB}?mode=ro", uri=True, timeout=2.0)
-        for cid, pid in conn.execute(
-            "SELECT conversation_id, parent_conversation_id "
-            "FROM conversation_summaries WHERE parent_conversation_id != ''"
-        ):
-            if cid and pid:
-                children_map.setdefault(pid, []).append(cid)
+        try:
+            rows = conn.execute(
+                "SELECT conversation_id, parent_conversation_id, agent_name "
+                "FROM conversation_summaries WHERE parent_conversation_id != ''"
+            ).fetchall()
+            for cid, pid, aname in rows:
+                if cid and pid:
+                    children_map.setdefault(pid, []).append(cid)
+                    if aname:
+                        agent_names[cid] = str(aname)
+        except sqlite3.Error:
+            for cid, pid in conn.execute(
+                "SELECT conversation_id, parent_conversation_id "
+                "FROM conversation_summaries WHERE parent_conversation_id != ''"
+            ):
+                if cid and pid:
+                    children_map.setdefault(pid, []).append(cid)
         try:
             for cid, pid in conn.execute(
                 "SELECT conversation_id, parent_id FROM conversation_parents"
@@ -474,7 +486,7 @@ def get_descendant_conversation_ids(root_session_id: str) -> list[str]:
         except sqlite3.Error:
             pass
     except sqlite3.Error:
-        return []
+        return [], {}
     finally:
         if conn is not None:
             try:
@@ -494,6 +506,12 @@ def get_descendant_conversation_ids(root_session_id: str) -> list[str]:
         for grandchild in children_map.get(cid, []):
             if grandchild not in seen:
                 queue.append(grandchild)
+    return descendants, agent_names
+
+
+def get_descendant_conversation_ids(root_session_id: str) -> list[str]:
+    """Recursively find all descendant subagent conversation IDs from conversation_summaries.db."""
+    descendants, _ = _query_descendant_tree(root_session_id)
     return descendants
 
 
@@ -506,8 +524,10 @@ def read_subagent_aggregates(root_session_id: str) -> dict:
         "cache_read_tokens": 0,
         "output_tokens": 0,
         "est_cost_usd": 0.0,
+        "roles": {},
     }
-    for sub_id in get_descendant_conversation_ids(root_session_id):
+    descendants, agent_names = _query_descendant_tree(root_session_id)
+    for sub_id in descendants:
         sub_path = find_transcript_path(sub_id)
         if sub_path is None or not sub_path.is_file():
             continue
@@ -521,4 +541,7 @@ def read_subagent_aggregates(root_session_id: str) -> dict:
         agg["cache_read_tokens"] += int(st.get("cache_read_tokens") or 0)
         agg["output_tokens"] += int(st.get("output_tokens") or 0)
         agg["est_cost_usd"] += float(st.get("est_cost_usd") or 0.0)
+        role = agent_names.get(sub_id) or ""
+        if role:
+            agg["roles"][role] = agg["roles"].get(role, 0) + 1
     return agg

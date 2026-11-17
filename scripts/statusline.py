@@ -201,6 +201,17 @@ def capture_live_timing(session_id: str, sess_out: int, model_key: str) -> dict:
         return timing
 
 
+def format_cost_str(amount_usd: float) -> str:
+    usd_cny = os.environ.get("AGY_USD_CNY", "").strip()
+    if usd_cny:
+        try:
+            cny = amount_usd * float(usd_cny)
+            return f"~¥{cny:.2f}"
+        except ValueError:
+            pass
+    return f"~{fmt_usd(amount_usd)}"
+
+
 def main() -> None:
     try:
         raw = sys.stdin.read()
@@ -230,19 +241,10 @@ def main() -> None:
     sess_cache_read = int(t_stats.get("cache_read_tokens") or 0)
     sess_out = int(t_stats.get("output_tokens") or 0)
 
-    sub_agg = read_subagent_aggregates(session_id) if session_id else {}
-    sub_count = int(sub_agg.get("sub_count") or 0)
-    agg_steps = llm_steps + int(sub_agg.get("turns") or 0)
-    agg_in_uncached = sess_in_uncached + int(sub_agg.get("input_tokens") or 0)
-    agg_cache_read = sess_cache_read + int(sub_agg.get("cache_read_tokens") or 0)
-    agg_out = sess_out + int(sub_agg.get("output_tokens") or 0)
-    sub_cost_usd = float(sub_agg.get("est_cost_usd") or 0.0)
+    display_in = (sess_in_uncached + sess_cache_read) if t_stats else total_in
+    display_out = sess_out if (t_stats and sess_out > 0) else total_out
 
-    has_local = bool(t_stats) or sub_count > 0
-    display_in = (agg_in_uncached + agg_cache_read) if has_local else total_in
-    display_out = agg_out if (has_local and agg_out > 0) else total_out
-
-    sess_cache_pct = calc_cache_rate(agg_in_uncached, agg_cache_read) if has_local else None
+    sess_cache_pct = calc_cache_rate(sess_in_uncached, sess_cache_read) if t_stats else None
     cur_cache_pct = None
     if isinstance(cur, dict) and cur:
         cur_cache_pct = calc_cache_rate(
@@ -256,8 +258,7 @@ def main() -> None:
 
     parts = [f"Ctx {color_pct(used_pct)}"]
 
-    sub_tag = f"+{sub_count}子代理" if sub_count > 0 else ""
-    turn_step_tag = f"({user_turns}轮{agg_steps}步{sub_tag})" if (user_turns or agg_steps) else ""
+    turn_step_tag = f"({user_turns}轮{llm_steps}步)" if (user_turns or llm_steps) else ""
     parts.append(
         f"会话{turn_step_tag} {BLUE}In:{fmt_tokens(display_in)}{RESET} {MAGENTA}Out:{fmt_tokens(display_out)}{RESET}"
     )
@@ -297,30 +298,61 @@ def main() -> None:
             official_usd = cost.get("total_cost_usd")
 
     if isinstance(official_usd, (int, float)) and official_usd > 0:
-        display_usd = float(official_usd) + sub_cost_usd
+        main_usd = float(official_usd)
     else:
-        display_usd = (float(t_stats.get("est_cost_usd") or 0.0) if t_stats else 0.0) + sub_cost_usd
-        if display_usd <= 0 and isinstance(cur, dict) and cur:
-            display_usd = calc_step_cost_usd(
+        main_usd = float(t_stats.get("est_cost_usd") or 0.0) if t_stats else 0.0
+        if main_usd <= 0 and isinstance(cur, dict) and cur:
+            main_usd = calc_step_cost_usd(
                 model_key,
                 int(cur.get("input_tokens") or 0),
                 int(cur.get("cache_read_input_tokens") or 0),
                 int(cur.get("output_tokens") or 0),
             )
 
-    if display_usd > 0:
-        usd_cny = os.environ.get("AGY_USD_CNY", "").strip()
-        if usd_cny:
-            try:
-                cny = display_usd * float(usd_cny)
-                parts.append(f"{DIM}~¥{cny:.2f}{RESET}")
-            except ValueError:
-                parts.append(f"{DIM}~{fmt_usd(display_usd)}{RESET}")
-        else:
-            parts.append(f"{DIM}~{fmt_usd(display_usd)}{RESET}")
+    if main_usd > 0:
+        parts.append(f"{DIM}{format_cost_str(main_usd)}{RESET}")
 
     sep = f" {DIM}│{RESET} "
     print(sep.join(parts))
+
+    sub_agg = read_subagent_aggregates(session_id) if session_id else {}
+    sub_count = int(sub_agg.get("sub_count") or 0)
+    if sub_count > 0:
+        sub_steps = int(sub_agg.get("turns") or 0)
+        sub_in_uncached = int(sub_agg.get("input_tokens") or 0)
+        sub_cache_read = int(sub_agg.get("cache_read_tokens") or 0)
+        sub_in_total = sub_in_uncached + sub_cache_read
+        sub_out = int(sub_agg.get("output_tokens") or 0)
+        sub_cost = float(sub_agg.get("est_cost_usd") or 0.0)
+        sub_cache_pct = calc_cache_rate(sub_in_uncached, sub_cache_read)
+
+        roles = sub_agg.get("roles") or {}
+        role_items = sorted(roles.items(), key=lambda kv: (-kv[1], kv[0]))
+        if role_items:
+            shown = [f"{r}×{c}" for r, c in role_items[:2]]
+            if len(role_items) > 2:
+                shown.append("...")
+            role_str = f"·{','.join(shown)}"
+        else:
+            role_str = ""
+
+        sub_parts = [
+            f"↳ 子代理({sub_count}个{role_str}/{sub_steps}步) "
+            f"{BLUE}In:{fmt_tokens(sub_in_total)}{RESET} {MAGENTA}Out:{fmt_tokens(sub_out)}{RESET}"
+        ]
+        if sub_cache_pct is not None:
+            sub_parts.append(f"缓存 {GREEN}{sub_cache_pct:.1f}%{RESET}")
+        if sub_cost > 0:
+            sub_parts.append(f"{DIM}{format_cost_str(sub_cost)}{RESET}")
+
+        all_in = display_in + sub_in_total
+        all_out = display_out + sub_out
+        all_cost = main_usd + sub_cost
+        total_seg = f"总计 {BLUE}In:{fmt_tokens(all_in)}{RESET} {MAGENTA}Out:{fmt_tokens(all_out)}{RESET}"
+        if all_cost > 0:
+            total_seg += f" {DIM}{format_cost_str(all_cost)}{RESET}"
+        sub_parts.append(total_seg)
+        print(sep.join(sub_parts))
 
 
 if __name__ == "__main__":
