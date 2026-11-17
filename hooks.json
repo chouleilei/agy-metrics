@@ -1,0 +1,32 @@
+{
+  "agy-metrics-timer": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/record_timing.py",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/record_timing.py",
+        "timeout": 5
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/record_timing.py",
+        "timeout": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/record_timing.py",
+        "timeout": 5
+      }
+    ]
+  }
+}

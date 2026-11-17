@@ -1,0 +1,8 @@
+{
+  "name": "agy-metrics",
+  "version": "1.0.0",
+  "description": "Local-only session statusLine, timing (Token/s), cache hit rate, 512K context scaling, equivalent cost, Gemini weekly quota, and workspace history stats for Google Antigravity CLI (agy).",
+  "author": "chouleilei",
+  "repository": "https://github.com/chouleilei/agy-metrics",
+  "license": "MIT"
+}

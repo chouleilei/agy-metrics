@@ -1,0 +1,448 @@
+"""Shared helpers for agy-metrics hooks, statusLine, and agy-stats CLI."""
+
+import fcntl
+import json
+import os
+import re
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+
+def resolve_agy_dir() -> Path:
+    env_dir = os.environ.get("AGY_DATA_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    home_agy = Path.home() / ".gemini" / "antigravity-cli"
+    if home_agy.is_dir():
+        return home_agy
+    wrapper_agy = Path("/data/antigravity/home/.gemini/antigravity-cli")
+    if wrapper_agy.is_dir():
+        return wrapper_agy
+    return home_agy
+
+
+AGY_DIR = resolve_agy_dir()
+BRAIN_DIR = AGY_DIR / "brain"
+CACHE_DIR = AGY_DIR / "cache" / "agy_metrics"
+SUMMARIES_DB = AGY_DIR / "conversation_summaries.db"
+PRICING_FILE = AGY_DIR / "pricing.json"
+TCACHE_VERSION = 6
+
+_CUSTOM_PRICING_CACHE: dict | None = None
+
+
+def _load_custom_pricing() -> dict:
+    global _CUSTOM_PRICING_CACHE
+    if _CUSTOM_PRICING_CACHE is not None:
+        return _CUSTOM_PRICING_CACHE
+    data = {}
+    if PRICING_FILE.is_file():
+        try:
+            raw = json.loads(PRICING_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                data = raw
+        except Exception:
+            pass
+    _CUSTOM_PRICING_CACHE = data
+    return data
+
+
+def get_model_pricing(model: str, ts_iso: str = "") -> tuple[float, float, float] | None:
+    """Return (input, cache_read, output) USD per 1M tokens, or None if unknown."""
+    m = (model or "").lower()
+    if not m:
+        return None
+
+    custom = _load_custom_pricing()
+    if custom:
+        if m in custom and isinstance(custom[m], dict):
+            c = custom[m]
+            return float(c.get("input", 0)), float(c.get("cache_read", 0)), float(c.get("output", 0))
+        for prefix in sorted(custom.keys(), key=len, reverse=True):
+            if m.startswith(prefix.lower()) and isinstance(custom[prefix], dict):
+                c = custom[prefix]
+                return float(c.get("input", 0)), float(c.get("cache_read", 0)), float(c.get("output", 0))
+
+    day_str = ts_iso[:10] if len(ts_iso) >= 10 else datetime.now().strftime("%Y-%m-%d")
+
+    if m.startswith("gemini-4-hydrogen"):
+        return 1.50, 0.075, 7.50
+    if m.startswith("gemini-4-carbon"):
+        return (4.00, 0.20, 20.00) if day_str >= "2026-12-01" else (2.00, 0.20, 10.00)
+    if m.startswith("gemini-4-argon"):
+        return (4.00, 0.20, 20.00) if day_str >= "2026-12-01" else (2.00, 0.10, 10.00)
+    if m.startswith("gemini-3.8-flash"):
+        return (1.50, 0.075, 7.50) if day_str >= "2027-01-01" else (0.75, 0.0375, 3.75)
+    if m.startswith("claude-opus-5-5"):
+        return 4.00, 0.20, 20.00
+    if m.startswith("claude-sonnet-5-5"):
+        return 2.00, 0.10, 10.00
+    return None
+
+
+def calc_step_cost_usd(
+    model: str,
+    uncached_input: int,
+    cache_read: int,
+    output: int,
+    ts_iso: str = "",
+) -> float:
+    rates = get_model_pricing(model, ts_iso)
+    if not rates:
+        return 0.0
+    p_in, p_cr, p_out = rates
+    return (uncached_input * p_in + cache_read * p_cr + output * p_out) / 1_000_000.0
+
+
+def fmt_usd(amount: float) -> str:
+    if amount <= 0:
+        return "--"
+    if amount < 0.1:
+        return f"${amount:.3f}"
+    return f"${amount:.2f}"
+
+
+def safe_id(session_id: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]", "_", session_id or "default")
+    return cleaned[:128] or "default"
+
+
+def fmt_tokens(n: int | float) -> str:
+    n = int(round(n))
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 10_000:
+        return f"{n / 1_000:.1f}k"
+    if n >= 1_000:
+        return f"{n / 1_000:.2f}k"
+    return str(n)
+
+
+def calc_cache_rate(
+    uncached_input: int,
+    cache_read: int,
+    cache_create: int = 0,
+) -> float | None:
+    denom = uncached_input + cache_read + cache_create
+    if denom <= 0:
+        return None
+    return (cache_read / denom) * 100.0
+
+
+def parse_iso_local(ts: str) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.astimezone()
+    except Exception:
+        return None
+
+
+@contextmanager
+def session_lock(session_id: str):
+    """Advisory file lock for atomic timing state updates."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = CACHE_DIR / f"{safe_id(session_id)}.lock"
+    f = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
+def load_json_safe(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def find_transcript_path(session_id: str, explicit_path: str = "") -> Path | None:
+    if explicit_path:
+        p = Path(explicit_path)
+        if p.name == "transcript_full.jsonl":
+            compact = p.with_name("transcript.jsonl")
+            if compact.is_file():
+                return compact
+        if p.is_file():
+            return p
+    if session_id:
+        candidate = BRAIN_DIR / session_id / ".system_generated" / "logs" / "transcript.jsonl"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def read_transcript_incremental(transcript_path: Path, session_id: str) -> dict:
+    """Incrementally aggregate USER_INPUT turns and PLANNER_RESPONSE steps."""
+    cache_file = CACHE_DIR / f"{safe_id(session_id)}_tcache.json"
+    cached = load_json_safe(cache_file) if cache_file.is_file() else {}
+
+    try:
+        st = transcript_path.stat()
+    except OSError:
+        return {
+            "user_turns": 0,
+            "turns": 0,
+            "input_tokens": 0,
+            "cache_read_tokens": 0,
+            "output_tokens": 0,
+            "est_cost_usd": 0.0,
+            "last_output_tokens": 0,
+            "last_ctx_tokens": 0,
+            "last_model": "",
+            "last_created_at": "",
+        }
+
+    same_file = (
+        cached.get("version") == TCACHE_VERSION
+        and "est_cost_usd" in cached
+        and cached.get("path") == str(transcript_path)
+        and cached.get("inode") == st.st_ino
+        and cached.get("offset", 0) <= st.st_size
+    )
+    offset = cached.get("offset", 0) if same_file else 0
+    user_turns = cached.get("user_turns", 0) if same_file else 0
+    turns = cached.get("turns", 0) if same_file else 0
+    in_tok = cached.get("input_tokens", 0) if same_file else 0
+    cr_tok = cached.get("cache_read_tokens", 0) if same_file else 0
+    out_tok = cached.get("output_tokens", 0) if same_file else 0
+    est_cost = float(cached.get("est_cost_usd", 0.0)) if same_file else 0.0
+    last_out = cached.get("last_output_tokens", 0) if same_file else 0
+    last_ctx = cached.get("last_ctx_tokens", 0) if same_file else 0
+    last_model = cached.get("last_model", "") if same_file else ""
+    last_created_at = cached.get("last_created_at", "") if same_file else ""
+
+    if offset < st.st_size:
+        try:
+            with transcript_path.open("rb") as f:
+                f.seek(offset)
+                chunk = f.read()
+            last_nl = chunk.rfind(b"\n")
+            if last_nl != -1:
+                complete = chunk[: last_nl + 1]
+                offset += len(complete)
+                for raw_line in complete.splitlines():
+                    has_plan = b'"PLANNER_RESPONSE"' in raw_line
+                    has_user = b'"USER_INPUT"' in raw_line
+                    if not (has_plan or has_user):
+                        continue
+                    try:
+                        obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+                    except Exception:
+                        continue
+                    step_type = obj.get("type")
+                    if step_type == "USER_INPUT":
+                        user_turns += 1
+                    elif step_type == "PLANNER_RESPONSE":
+                        turns += 1
+                        step_in = int(obj.get("input_tokens") or 0)
+                        step_cr = int(obj.get("cache_read_tokens") or 0)
+                        step_out = int(obj.get("output_tokens") or 0)
+                        in_tok += step_in
+                        cr_tok += step_cr
+                        out_tok += step_out
+                        last_out = step_out
+                        last_ctx = step_in + step_cr + step_out
+                        step_model = obj.get("model") or ""
+                        if step_model:
+                            last_model = step_model
+                        if obj.get("created_at"):
+                            last_created_at = str(obj.get("created_at"))
+                        est_cost += calc_step_cost_usd(
+                            step_model or last_model,
+                            step_in,
+                            step_cr,
+                            step_out,
+                            obj.get("created_at") or "",
+                        )
+        except OSError:
+            pass
+
+        result = {
+            "version": TCACHE_VERSION,
+            "path": str(transcript_path),
+            "inode": st.st_ino,
+            "offset": offset,
+            "user_turns": user_turns,
+            "turns": turns,
+            "input_tokens": in_tok,
+            "cache_read_tokens": cr_tok,
+            "output_tokens": out_tok,
+            "est_cost_usd": round(est_cost, 6),
+            "last_output_tokens": last_out,
+            "last_ctx_tokens": last_ctx,
+            "last_model": last_model,
+            "last_created_at": last_created_at,
+        }
+        try:
+            atomic_write_json(cache_file, result)
+        except OSError:
+            pass
+        return result
+
+    return {
+        "user_turns": user_turns,
+        "turns": turns,
+        "input_tokens": in_tok,
+        "cache_read_tokens": cr_tok,
+        "output_tokens": out_tok,
+        "est_cost_usd": round(est_cost, 6),
+        "last_output_tokens": last_out,
+        "last_ctx_tokens": last_ctx,
+        "last_model": last_model,
+        "last_created_at": last_created_at,
+    }
+
+
+def parse_transcript_full(transcript_path: Path) -> dict:
+    """Parse all USER_INPUT turns and PLANNER_RESPONSE steps from transcript.jsonl."""
+    steps = []
+    user_turns = 0
+    user_dates = []
+    in_tok = 0
+    cr_tok = 0
+    out_tok = 0
+    est_cost = 0.0
+    first_dt = None
+    last_dt = None
+    by_model: dict[str, dict[str, float]] = {}
+
+    try:
+        with transcript_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                has_plan = '"PLANNER_RESPONSE"' in line
+                has_user = '"USER_INPUT"' in line
+                if not (has_plan or has_user):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                step_type = obj.get("type")
+                if step_type == "USER_INPUT":
+                    user_turns += 1
+                    udt = parse_iso_local(obj.get("created_at") or "")
+                    if udt:
+                        user_dates.append(udt.date())
+                        if first_dt is None or udt < first_dt:
+                            first_dt = udt
+                        if last_dt is None or udt > last_dt:
+                            last_dt = udt
+                    continue
+                if step_type != "PLANNER_RESPONSE":
+                    continue
+                inp = int(obj.get("input_tokens") or 0)
+                cr = int(obj.get("cache_read_tokens") or 0)
+                out = int(obj.get("output_tokens") or 0)
+                model = obj.get("model") or "unknown"
+                ts = obj.get("created_at") or ""
+                step_cost = calc_step_cost_usd(model, inp, cr, out, ts)
+                dt = parse_iso_local(ts)
+                if dt:
+                    if first_dt is None or dt < first_dt:
+                        first_dt = dt
+                    if last_dt is None or dt > last_dt:
+                        last_dt = dt
+                in_tok += inp
+                cr_tok += cr
+                out_tok += out
+                est_cost += step_cost
+                m_bucket = by_model.setdefault(
+                    model,
+                    {"turns": 0, "input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+                )
+                m_bucket["turns"] += 1
+                m_bucket["input_tokens"] += inp
+                m_bucket["cache_read_tokens"] += cr
+                m_bucket["output_tokens"] += out
+                m_bucket["cost_usd"] += step_cost
+                steps.append(
+                    {
+                        "step_index": obj.get("step_index"),
+                        "created_at": ts,
+                        "dt": dt,
+                        "model": model,
+                        "input_tokens": inp,
+                        "cache_read_tokens": cr,
+                        "output_tokens": out,
+                        "cost_usd": step_cost,
+                    }
+                )
+    except OSError:
+        pass
+
+    return {
+        "user_turns": user_turns,
+        "user_dates": user_dates,
+        "turns": len(steps),
+        "input_tokens": in_tok,
+        "cache_read_tokens": cr_tok,
+        "output_tokens": out_tok,
+        "est_cost_usd": est_cost,
+        "first_dt": first_dt,
+        "last_dt": last_dt,
+        "by_model": by_model,
+        "steps": steps,
+    }
+
+
+def _normalize_workspace_uri(uri: str) -> str:
+    if uri.startswith("file://"):
+        raw_path = unquote(urlparse(uri).path)
+        return os.path.realpath(raw_path) if raw_path else ""
+    return uri
+
+
+def load_conversation_metadata() -> dict[str, dict]:
+    """Read session titles and workspace paths from conversation_summaries.db."""
+    meta: dict[str, dict] = {}
+    if not SUMMARIES_DB.is_file():
+        return meta
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{SUMMARIES_DB}?mode=ro", uri=True, timeout=2.0)
+        rows = conn.execute(
+            "SELECT conversation_id, title, workspace_uris, parent_conversation_id "
+            "FROM conversation_summaries"
+        ).fetchall()
+        for cid, title, w_json, pid in rows:
+            workspaces = []
+            if w_json:
+                try:
+                    raw_uris = json.loads(w_json)
+                    for u in raw_uris:
+                        norm = _normalize_workspace_uri(str(u))
+                        if norm and norm not in workspaces:
+                            workspaces.append(norm)
+                except Exception:
+                    pass
+            meta[cid] = {
+                "title": title or "",
+                "workspaces": workspaces,
+                "parent_id": pid or "",
+            }
+    except sqlite3.Error:
+        pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return meta
