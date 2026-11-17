@@ -28,6 +28,7 @@ from agy_metrics_lib import (
     fmt_duration,
     fmt_tokens,
     fmt_usd,
+    heal_timing_state,
     load_json_safe,
     read_subagent_aggregates,
     read_transcript_incremental,
@@ -172,6 +173,7 @@ def capture_live_timing(session_id: str, sess_out: int, model_key: str) -> dict:
     state_path = CACHE_DIR / f"{safe_id(session_id)}.json"
     with session_lock(session_id):
         timing = load_json_safe(state_path)
+        healed = heal_timing_state(timing)
         now = time.time()
         if (
             timing.get("inv_active")
@@ -183,6 +185,9 @@ def capture_live_timing(session_id: str, sess_out: int, model_key: str) -> dict:
             delta_out = sess_out - start_out
             if delta_out > 0 and finalize_invocation_timing(timing, now, delta_out, model_key):
                 atomic_write_json(state_path, timing)
+                return timing
+        if healed:
+            atomic_write_json(state_path, timing)
         return timing
 
 

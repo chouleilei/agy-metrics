@@ -142,11 +142,38 @@ def merge_intervals_duration(intervals: list[list[float]] | list[tuple[float, fl
     return total
 
 
+def heal_timing_state(state: dict) -> bool:
+    """Backfill legacy cum_model_elapsed from cum_elapsed so cum_tps stays consistent across upgrades."""
+    if not isinstance(state, dict):
+        return False
+    cum_el = float(state.get("cum_elapsed") or 0.0)
+    cum_out = int(state.get("cum_out") or 0)
+    if cum_el <= 0:
+        return False
+    m_raw = state.get("cum_model_elapsed")
+    t_raw = state.get("cum_tool_elapsed")
+    if m_raw is None and t_raw is None:
+        return False
+    m_el = float(m_raw or 0.0)
+    t_el = float(t_raw or 0.0)
+    gap = cum_el - (m_el + t_el)
+    if gap > 1.0:
+        m_el += gap
+        state["cum_model_elapsed"] = round(m_el, 3)
+        state["cum_tool_elapsed"] = round(t_el, 3)
+        if cum_out > 0 and m_el > 0:
+            state["cum_tps"] = round(cum_out / m_el, 2)
+        return True
+    return False
+
+
 def finalize_invocation_timing(state: dict, now: float, delta_out: int, model_key: str) -> bool:
     """Finalize one invocation's model/tool durations and pure-model TPS into state."""
     inv_start = state.get("inv_start")
     if not inv_start or now <= float(inv_start) or state.get("inv_captured") or delta_out <= 0:
         return False
+
+    heal_timing_state(state)
 
     total_elapsed = max(0.05, now - float(inv_start))
     intervals = list(state.get("inv_tool_intervals") or [])
@@ -158,9 +185,13 @@ def finalize_invocation_timing(state: dict, now: float, delta_out: int, model_ke
     tool_elapsed = min(total_elapsed, merge_intervals_duration(intervals))
     model_elapsed = max(0.05, total_elapsed - tool_elapsed)
 
+    prev_cum_el = float(state.get("cum_elapsed") or 0.0)
+    prev_m_el = state.get("cum_model_elapsed")
+    base_m_el = float(prev_m_el) if prev_m_el is not None else prev_cum_el
+
     cum_out = int(state.get("cum_out") or 0) + delta_out
-    cum_elapsed = float(state.get("cum_elapsed") or 0.0) + total_elapsed
-    cum_model_elapsed = float(state.get("cum_model_elapsed") or 0.0) + model_elapsed
+    cum_elapsed = prev_cum_el + total_elapsed
+    cum_model_elapsed = base_m_el + model_elapsed
     cum_tool_elapsed = float(state.get("cum_tool_elapsed") or 0.0) + tool_elapsed
 
     by_model = state.setdefault("by_model", {})

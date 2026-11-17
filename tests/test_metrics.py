@@ -84,6 +84,30 @@ class TestMetricsLib(unittest.TestCase):
         self.assertEqual(lib.fmt_duration(75.0), "1m15s")
         self.assertEqual(lib.fmt_duration(3665.0), "1h01m")
 
+    def test_legacy_timing_state_upgrade_heals_tps(self):
+        # Case 1: legacy state without cum_model_elapsed upgrades cleanly
+        legacy = {
+            "cum_out": 10000,
+            "cum_elapsed": 200.0,
+            "cum_tps": 50.0,
+            "inv_start": 1000.0,
+        }
+        self.assertTrue(lib.finalize_invocation_timing(legacy, 1002.0, 100, "gemini-4-hydrogen-xhigh"))
+        self.assertAlmostEqual(legacy["cum_model_elapsed"], 202.0, places=2)
+        self.assertAlmostEqual(legacy["cum_tps"], 50.0, places=1)
+
+        # Case 2: damaged state with partial cum_model_elapsed self-heals
+        damaged = {
+            "cum_out": 200000,
+            "cum_elapsed": 3000.0,
+            "cum_model_elapsed": 400.0,
+            "cum_tool_elapsed": 1.0,
+            "cum_tps": 500.0,
+        }
+        self.assertTrue(lib.heal_timing_state(damaged))
+        self.assertAlmostEqual(damaged["cum_model_elapsed"], 2999.0, places=2)
+        self.assertAlmostEqual(damaged["cum_tps"], round(200000 / 2999.0, 2), places=2)
+
 
 class TestEndToEndScripts(unittest.TestCase):
     def setUp(self):
