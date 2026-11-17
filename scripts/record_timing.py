@@ -19,6 +19,7 @@ else:
 from agy_metrics_lib import (
     CACHE_DIR,
     atomic_write_json,
+    finalize_invocation_timing,
     find_transcript_path,
     load_json_safe,
     read_transcript_incremental,
@@ -63,6 +64,22 @@ def main() -> None:
                     state["inv_start_out"] = total_out
                     state["inv_active"] = True
                     state["inv_captured"] = False
+                    state["inv_active_tools"] = {}
+                    state["inv_tool_intervals"] = []
+                elif event == "PreToolUse":
+                    tool_call = payload.get("toolCall") or {}
+                    tool_id = str(tool_call.get("id") or f"anon_{now}")
+                    active_tools = state.setdefault("inv_active_tools", {})
+                    active_tools[tool_id] = now
+                elif event == "PostToolUse":
+                    tool_call = payload.get("toolCall") or {}
+                    tool_id = str(tool_call.get("id") or "")
+                    active_tools = state.get("inv_active_tools") or {}
+                    if tool_id and tool_id in active_tools:
+                        start_ts = float(active_tools.pop(tool_id))
+                        intervals = state.setdefault("inv_tool_intervals", [])
+                        intervals.append([start_ts, max(start_ts, now)])
+                        state["inv_active_tools"] = active_tools
                 elif event in ("PostInvocation", "Stop"):
                     inv_start = state.get("inv_start")
                     already_captured = bool(state.get("inv_captured"))
@@ -71,32 +88,18 @@ def main() -> None:
                         start_out = int(state.get("inv_start_out") or 0)
                         delta_out = total_out - start_out
                         if delta_out > 0:
-                            elapsed = max(0.05, now - float(inv_start))
-                            cum_out = int(state.get("cum_out") or 0) + delta_out
-                            cum_elapsed = float(state.get("cum_elapsed") or 0.0) + elapsed
-
                             model_key = last_model or payload.get("modelName") or "unknown"
-                            by_model = state.setdefault("by_model", {})
-                            mb = by_model.setdefault(model_key, {"out": 0, "elapsed": 0.0})
-                            mb["out"] = int(mb.get("out") or 0) + delta_out
-                            mb["elapsed"] = round(float(mb.get("elapsed") or 0.0) + elapsed, 3)
-
-                            state["last_elapsed"] = round(elapsed, 3)
-                            state["last_out_tokens"] = delta_out
-                            state["last_tps"] = round(delta_out / elapsed, 2)
-                            state["cum_out"] = cum_out
-                            state["cum_elapsed"] = round(cum_elapsed, 3)
-                            state["cum_tps"] = round(cum_out / cum_elapsed, 2)
-                            state["inv_captured"] = True
-                            state["last_updated"] = now
+                            finalize_invocation_timing(state, now, delta_out, model_key)
                     if event == "Stop":
                         state["inv_active"] = False
+                        state["inv_active_tools"] = {}
+                        state["inv_tool_intervals"] = []
 
                 atomic_write_json(state_path, state)
     except Exception:
         pass
 
-    if event == "Stop":
+    if event in ("Stop", "PreToolUse"):
         sys.stdout.write('{"decision": "allow"}\n')
     else:
         sys.stdout.write("{}\n")

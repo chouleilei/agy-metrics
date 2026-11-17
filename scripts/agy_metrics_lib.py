@@ -105,6 +105,85 @@ def fmt_usd(amount: float) -> str:
     return f"${amount:.2f}"
 
 
+def fmt_duration(seconds: float) -> str:
+    seconds = max(0.0, float(seconds or 0.0))
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    total_sec = int(round(seconds))
+    mins, secs = divmod(total_sec, 60)
+    if mins < 60:
+        return f"{mins}m{secs:02d}s"
+    hours, mins = divmod(mins, 60)
+    return f"{hours}h{mins:02d}m"
+
+
+def merge_intervals_duration(intervals: list[list[float]] | list[tuple[float, float]]) -> float:
+    """Return total wall-clock duration covered by possibly overlapping [start, end] intervals."""
+    valid = []
+    for item in intervals or []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        s, e = float(item[0]), float(item[1])
+        if e > s:
+            valid.append((s, e))
+    if not valid:
+        return 0.0
+    valid.sort(key=lambda x: x[0])
+    total = 0.0
+    cur_s, cur_e = valid[0]
+    for s, e in valid[1:]:
+        if s <= cur_e:
+            if e > cur_e:
+                cur_e = e
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, e
+    total += cur_e - cur_s
+    return total
+
+
+def finalize_invocation_timing(state: dict, now: float, delta_out: int, model_key: str) -> bool:
+    """Finalize one invocation's model/tool durations and pure-model TPS into state."""
+    inv_start = state.get("inv_start")
+    if not inv_start or now <= float(inv_start) or state.get("inv_captured") or delta_out <= 0:
+        return False
+
+    total_elapsed = max(0.05, now - float(inv_start))
+    intervals = list(state.get("inv_tool_intervals") or [])
+    active_tools = state.get("inv_active_tools") or {}
+    for st in active_tools.values():
+        st_f = float(st)
+        intervals.append([st_f, max(st_f, now)])
+
+    tool_elapsed = min(total_elapsed, merge_intervals_duration(intervals))
+    model_elapsed = max(0.05, total_elapsed - tool_elapsed)
+
+    cum_out = int(state.get("cum_out") or 0) + delta_out
+    cum_elapsed = float(state.get("cum_elapsed") or 0.0) + total_elapsed
+    cum_model_elapsed = float(state.get("cum_model_elapsed") or 0.0) + model_elapsed
+    cum_tool_elapsed = float(state.get("cum_tool_elapsed") or 0.0) + tool_elapsed
+
+    by_model = state.setdefault("by_model", {})
+    mb = by_model.setdefault(model_key or "unknown", {"out": 0, "elapsed": 0.0})
+    mb["out"] = int(mb.get("out") or 0) + delta_out
+    mb["elapsed"] = round(float(mb.get("elapsed") or 0.0) + model_elapsed, 3)
+
+    state["last_elapsed"] = round(model_elapsed, 3)
+    state["last_tool_elapsed"] = round(tool_elapsed, 3)
+    state["last_out_tokens"] = delta_out
+    state["last_tps"] = round(delta_out / model_elapsed, 2)
+    state["cum_out"] = cum_out
+    state["cum_elapsed"] = round(cum_elapsed, 3)
+    state["cum_model_elapsed"] = round(cum_model_elapsed, 3)
+    state["cum_tool_elapsed"] = round(cum_tool_elapsed, 3)
+    state["cum_tps"] = round(cum_out / cum_model_elapsed, 2)
+    state["inv_captured"] = True
+    state["last_updated"] = now
+    state["inv_active_tools"] = {}
+    state["inv_tool_intervals"] = []
+    return True
+
+
 def safe_id(session_id: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9._-]", "_", session_id or "default")
     return cleaned[:128] or "default"
@@ -527,6 +606,8 @@ def read_subagent_aggregates(root_session_id: str) -> dict:
         "roles": {},
         "timed_out": 0,
         "timed_elapsed": 0.0,
+        "model_elapsed": 0.0,
+        "tool_elapsed": 0.0,
         "avg_tps": None,
         "last_tps": None,
         "last_elapsed": None,
@@ -554,9 +635,14 @@ def read_subagent_aggregates(root_session_id: str) -> dict:
         t_cache = load_json_safe(CACHE_DIR / f"{safe_id(sub_id)}.json")
         c_out = int(t_cache.get("cum_out") or 0)
         c_el = float(t_cache.get("cum_elapsed") or 0.0)
+        c_m_el = float(t_cache.get("cum_model_elapsed") or 0.0)
+        c_t_el = float(t_cache.get("cum_tool_elapsed") or 0.0)
         if c_out > 0 and c_el > 0:
             agg["timed_out"] += c_out
-            agg["timed_elapsed"] += c_el
+            agg["timed_elapsed"] += c_m_el if c_m_el > 0 else c_el
+        if c_m_el > 0 or c_t_el > 0:
+            agg["model_elapsed"] += c_m_el
+            agg["tool_elapsed"] += c_t_el
         l_upd = float(t_cache.get("last_updated") or 0.0)
         if t_cache.get("last_tps") is not None and l_upd >= latest_updated:
             latest_updated = l_upd

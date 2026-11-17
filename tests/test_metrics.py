@@ -77,6 +77,13 @@ class TestMetricsLib(unittest.TestCase):
         # Step 2: 0.05*2.0 + 0.15*0.10 + 0.005*10.0 = 0.165
         self.assertAlmostEqual(full["est_cost_usd"], 0.4575, places=5)
 
+    def test_merge_intervals_and_duration_format(self):
+        self.assertAlmostEqual(lib.merge_intervals_duration([[0.0, 5.0], [2.0, 8.0], [10.0, 12.0]]), 10.0)
+        self.assertAlmostEqual(lib.merge_intervals_duration([]), 0.0)
+        self.assertEqual(lib.fmt_duration(4.26), "4.3s")
+        self.assertEqual(lib.fmt_duration(75.0), "1m15s")
+        self.assertEqual(lib.fmt_duration(3665.0), "1h01m")
+
 
 class TestEndToEndScripts(unittest.TestCase):
     def setUp(self):
@@ -355,6 +362,82 @@ class TestEndToEndScripts(unittest.TestCase):
         self.assertEqual(s0["input_tokens"], 35000)
         self.assertEqual(s0["cache_read_tokens"], 185000)
         self.assertEqual(s0["output_tokens"], 1800)
+
+    def test_pretool_posttool_timing_split(self):
+        sid = "conv-tool-split"
+        logs_dir = self.brain / sid / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        tp = logs_dir / "transcript.jsonl"
+        tp.write_text(
+            json.dumps({"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-18T00:00:00Z"}) + "\n",
+            encoding="utf-8",
+        )
+
+        subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "record_timing.py")],
+            input=json.dumps({"conversationId": sid, "hookEventName": "PreInvocation", "transcriptPath": str(tp)}),
+            text=True, capture_output=True, env=self.env, check=True,
+        )
+        time.sleep(0.08)
+
+        # Two overlapping parallel tools
+        for tid in ("t1", "t2"):
+            r_pre = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "record_timing.py")],
+                input=json.dumps({
+                    "conversationId": sid,
+                    "hookEventName": "PreToolUse",
+                    "transcriptPath": str(tp),
+                    "toolCall": {"id": tid, "name": "run_command"},
+                }),
+                text=True, capture_output=True, env=self.env, check=True,
+            )
+            self.assertEqual(json.loads(r_pre.stdout), {"decision": "allow"})
+
+        time.sleep(0.12)
+        for tid in ("t1", "t2"):
+            r_post = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "record_timing.py")],
+                input=json.dumps({
+                    "conversationId": sid,
+                    "hookEventName": "PostToolUse",
+                    "transcriptPath": str(tp),
+                    "toolCall": {"id": tid, "name": "run_command"},
+                }),
+                text=True, capture_output=True, env=self.env, check=True,
+            )
+            self.assertEqual(json.loads(r_post.stdout), {})
+
+        with tp.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-18T00:00:01Z",
+                "model": "gemini-4-hydrogen-xhigh",
+                "input_tokens": 1000,
+                "cache_read_tokens": 9000,
+                "output_tokens": 200,
+            }) + "\n")
+
+        subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "record_timing.py")],
+            input=json.dumps({"conversationId": sid, "hookEventName": "Stop", "transcriptPath": str(tp)}),
+            text=True, capture_output=True, env=self.env, check=True,
+        )
+
+        st = json.loads((self.cache / f"{sid}.json").read_text(encoding="utf-8"))
+        self.assertGreater(st["cum_tool_elapsed"], 0.10)
+        self.assertGreater(st["cum_model_elapsed"], 0.04)
+        self.assertLess(st["cum_tool_elapsed"], st["cum_elapsed"])
+
+        r_sl = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "statusline.py")],
+            input=json.dumps({"session_id": sid, "transcript_path": str(tp)}),
+            text=True, capture_output=True, env=self.env, check=True,
+        )
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", r_sl.stdout)
+        self.assertIn("耗时 模型", plain)
+        self.assertIn("/工具", plain)
 
 
 if __name__ == "__main__":

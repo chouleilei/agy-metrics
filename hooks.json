@@ -7,6 +7,30 @@
         "timeout": 5
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./scripts/record_timing.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./scripts/record_timing.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PreInvocation": [
       {
         "type": "command",

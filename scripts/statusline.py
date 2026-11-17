@@ -23,7 +23,9 @@ from agy_metrics_lib import (
     atomic_write_json,
     calc_cache_rate,
     calc_step_cost_usd,
+    finalize_invocation_timing,
     find_transcript_path,
+    fmt_duration,
     fmt_tokens,
     fmt_usd,
     load_json_safe,
@@ -179,24 +181,7 @@ def capture_live_timing(session_id: str, sess_out: int, model_key: str) -> dict:
         ):
             start_out = int(timing.get("inv_start_out") or 0)
             delta_out = sess_out - start_out
-            if delta_out > 0:
-                elapsed = max(0.05, now - float(timing["inv_start"]))
-                cum_out = int(timing.get("cum_out") or 0) + delta_out
-                cum_elapsed = float(timing.get("cum_elapsed") or 0.0) + elapsed
-
-                by_model = timing.setdefault("by_model", {})
-                mb = by_model.setdefault(model_key or "unknown", {"out": 0, "elapsed": 0.0})
-                mb["out"] = int(mb.get("out") or 0) + delta_out
-                mb["elapsed"] = round(float(mb.get("elapsed") or 0.0) + elapsed, 3)
-
-                timing["last_elapsed"] = round(elapsed, 3)
-                timing["last_out_tokens"] = delta_out
-                timing["last_tps"] = round(delta_out / elapsed, 2)
-                timing["cum_out"] = cum_out
-                timing["cum_elapsed"] = round(cum_elapsed, 3)
-                timing["cum_tps"] = round(cum_out / cum_elapsed, 2)
-                timing["inv_captured"] = True
-                timing["last_updated"] = now
+            if delta_out > 0 and finalize_invocation_timing(timing, now, delta_out, model_key):
                 atomic_write_json(state_path, timing)
         return timing
 
@@ -284,6 +269,15 @@ def main() -> None:
     else:
         parts.append(f"速度 {DIM}--{RESET}")
 
+    m_el = timing.get("cum_model_elapsed")
+    t_el = timing.get("cum_tool_elapsed")
+    if m_el is not None or t_el is not None:
+        parts.append(
+            f"耗时 模型{YELLOW}{fmt_duration(float(m_el or 0.0))}{RESET}/工具{BLUE}{fmt_duration(float(t_el or 0.0))}{RESET}"
+        )
+    elif timing.get("cum_elapsed") is not None:
+        parts.append(f"耗时 {YELLOW}{fmt_duration(float(timing['cum_elapsed']))}{RESET}")
+
     weekly_pct = get_gemini_weekly_pct()
     if weekly_pct is not None:
         parts.append(f"周余 {color_quota_pct(weekly_pct)}")
@@ -354,6 +348,13 @@ def main() -> None:
             sub_parts.append(f"平均 {YELLOW}{sub_avg_tps:.1f}{RESET} tok/s")
         else:
             sub_parts.append(f"速度 {DIM}--{RESET}")
+
+        sub_m_el = float(sub_agg.get("model_elapsed") or 0.0)
+        sub_t_el = float(sub_agg.get("tool_elapsed") or 0.0)
+        if sub_m_el > 0 or sub_t_el > 0:
+            sub_parts.append(
+                f"耗时 模型{YELLOW}{fmt_duration(sub_m_el)}{RESET}/工具{BLUE}{fmt_duration(sub_t_el)}{RESET}"
+            )
 
         if sub_cost > 0:
             sub_parts.append(f"{DIM}{format_cost_str(sub_cost)}{RESET}")
