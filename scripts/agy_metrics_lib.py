@@ -446,3 +446,79 @@ def load_conversation_metadata() -> dict[str, dict]:
             except Exception:
                 pass
     return meta
+
+
+def get_descendant_conversation_ids(root_session_id: str) -> list[str]:
+    """Recursively find all descendant subagent conversation IDs from conversation_summaries.db."""
+    if not root_session_id or not SUMMARIES_DB.is_file():
+        return []
+
+    children_map: dict[str, list[str]] = {}
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{SUMMARIES_DB}?mode=ro", uri=True, timeout=2.0)
+        for cid, pid in conn.execute(
+            "SELECT conversation_id, parent_conversation_id "
+            "FROM conversation_summaries WHERE parent_conversation_id != ''"
+        ):
+            if cid and pid:
+                children_map.setdefault(pid, []).append(cid)
+        try:
+            for cid, pid in conn.execute(
+                "SELECT conversation_id, parent_id FROM conversation_parents"
+            ):
+                if cid and pid:
+                    bucket = children_map.setdefault(pid, [])
+                    if cid not in bucket:
+                        bucket.append(cid)
+        except sqlite3.Error:
+            pass
+    except sqlite3.Error:
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    descendants: list[str] = []
+    seen = {root_session_id}
+    queue = list(children_map.get(root_session_id, []))
+    while queue:
+        cid = queue.pop(0)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        descendants.append(cid)
+        for grandchild in children_map.get(cid, []):
+            if grandchild not in seen:
+                queue.append(grandchild)
+    return descendants
+
+
+def read_subagent_aggregates(root_session_id: str) -> dict:
+    """Incrementally aggregate transcript stats across all descendant subagents."""
+    agg = {
+        "sub_count": 0,
+        "turns": 0,
+        "input_tokens": 0,
+        "cache_read_tokens": 0,
+        "output_tokens": 0,
+        "est_cost_usd": 0.0,
+    }
+    for sub_id in get_descendant_conversation_ids(root_session_id):
+        sub_path = find_transcript_path(sub_id)
+        if sub_path is None or not sub_path.is_file():
+            continue
+        with session_lock(sub_id):
+            st = read_transcript_incremental(sub_path, sub_id)
+        if st.get("turns", 0) <= 0 and st.get("user_turns", 0) <= 0:
+            continue
+        agg["sub_count"] += 1
+        agg["turns"] += int(st.get("turns") or 0)
+        agg["input_tokens"] += int(st.get("input_tokens") or 0)
+        agg["cache_read_tokens"] += int(st.get("cache_read_tokens") or 0)
+        agg["output_tokens"] += int(st.get("output_tokens") or 0)
+        agg["est_cost_usd"] += float(st.get("est_cost_usd") or 0.0)
+    return agg

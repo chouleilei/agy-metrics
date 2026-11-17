@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -219,6 +220,106 @@ class TestEndToEndScripts(unittest.TestCase):
         stats_json = json.loads(r_stats.stdout)
         self.assertEqual(stats_json["sessions_count"], 1)
         self.assertIsNotNone(stats_json["by_model"]["gemini-4-hydrogen-xhigh"]["avg_tps"])
+
+    def test_subagent_recursive_aggregation(self):
+        root_id = "conv-root-1"
+        child_id = "conv-child-1"
+        grandchild_id = "conv-grandchild-1"
+
+        def write_tx(cid: str, lines: list[dict]) -> Path:
+            d = self.brain / cid / ".system_generated" / "logs"
+            d.mkdir(parents=True, exist_ok=True)
+            p = d / "transcript.jsonl"
+            p.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+            return p
+
+        root_tp = write_tx(root_id, [
+            {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-17T08:00:00Z"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-17T08:00:02Z",
+                "model": "gemini-4-hydrogen-xhigh",
+                "input_tokens": 10000,
+                "cache_read_tokens": 90000,
+                "output_tokens": 500,
+            },
+        ])
+        write_tx(child_id, [
+            {
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-17T08:00:05Z",
+                "model": "gemini-4-hydrogen-xhigh",
+                "input_tokens": 20000,
+                "cache_read_tokens": 80000,
+                "output_tokens": 1000,
+            },
+        ])
+        write_tx(grandchild_id, [
+            {
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-17T08:00:08Z",
+                "model": "gemini-3.8-flash",
+                "input_tokens": 5000,
+                "cache_read_tokens": 15000,
+                "output_tokens": 300,
+            },
+        ])
+
+        db_path = self.agy_dir / "conversation_summaries.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE conversation_summaries ("
+            "conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT, parent_conversation_id TEXT)"
+        )
+        ws_json = json.dumps(["file:///root/agy-metrics"])
+        conn.executemany(
+            "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?)",
+            [
+                (root_id, "主编排任务", ws_json, ""),
+                (child_id, "", ws_json, root_id),
+                (grandchild_id, "", ws_json, child_id),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        r_sl = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "statusline.py")],
+            input=json.dumps({
+                "session_id": root_id,
+                "transcript_path": str(root_tp),
+                "context_window": {"context_window_size": 1048576, "used_percentage": 10.0},
+            }),
+            text=True,
+            capture_output=True,
+            env=self.env,
+            check=True,
+        )
+        out = r_sl.stdout
+        self.assertIn("1轮3步+2子代理", out)
+        # Total In: (10k+90k) + (20k+80k) + (5k+15k) = 220k; Total Out: 500+1000+300 = 1800 -> 1.80k
+        self.assertIn("In:220.0k", out)
+        self.assertIn("Out:1.80k", out)
+
+        r_stats = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "agy-stats"), "--json"],
+            text=True,
+            capture_output=True,
+            env=self.env,
+            check=True,
+        )
+        stats_json = json.loads(r_stats.stdout)
+        self.assertEqual(stats_json["sessions_count"], 1)
+        s0 = stats_json["sessions"][0]
+        self.assertEqual(s0["session_id"], root_id)
+        self.assertEqual(s0["subagent_count"], 2)
+        self.assertEqual(s0["turns"], 3)
+        self.assertEqual(s0["input_tokens"], 35000)
+        self.assertEqual(s0["cache_read_tokens"], 185000)
+        self.assertEqual(s0["output_tokens"], 1800)
 
 
 if __name__ == "__main__":

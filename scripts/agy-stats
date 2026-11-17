@@ -66,6 +66,90 @@ def load_all_sessions() -> list[dict]:
     return sessions
 
 
+def fold_subagent_sessions(raw_sessions: list[dict]) -> list[dict]:
+    """Fold subagent sessions into their root ancestor session."""
+    by_id = {s["session_id"]: s for s in raw_sessions}
+
+    def find_root_id(sid: str) -> str:
+        cur = sid
+        seen = {cur}
+        while True:
+            pid = (by_id.get(cur) or {}).get("parent_id") or ""
+            if not pid or pid not in by_id or pid in seen:
+                return cur
+            seen.add(pid)
+            cur = pid
+
+    folded: dict[str, dict] = {}
+    children_to_merge: list[tuple[str, dict]] = []
+
+    for s in raw_sessions:
+        root_id = find_root_id(s["session_id"])
+        if root_id == s["session_id"]:
+            copy_s = dict(s)
+            copy_s["user_dates"] = list(s.get("user_dates") or [])
+            copy_s["steps"] = list(s.get("steps") or [])
+            copy_s["workspaces"] = list(s.get("workspaces") or [])
+            copy_s["by_model"] = {k: dict(v) for k, v in (s.get("by_model") or {}).items()}
+            copy_s["timing_by_model"] = {k: dict(v) for k, v in (s.get("timing_by_model") or {}).items()}
+            copy_s["subagent_count"] = 0
+            copy_s["subagent_ids"] = []
+            folded[root_id] = copy_s
+        else:
+            children_to_merge.append((root_id, s))
+
+    for root_id, child in children_to_merge:
+        root = folded.get(root_id)
+        if root is None:
+            continue
+        root["subagent_count"] += 1
+        root["subagent_ids"].append(child["session_id"])
+        root["user_turns"] += int(child.get("user_turns") or 0)
+        root["turns"] += int(child.get("turns") or 0)
+        root["input_tokens"] += int(child.get("input_tokens") or 0)
+        root["cache_read_tokens"] += int(child.get("cache_read_tokens") or 0)
+        root["output_tokens"] += int(child.get("output_tokens") or 0)
+        root["est_cost_usd"] = float(root.get("est_cost_usd") or 0.0) + float(child.get("est_cost_usd") or 0.0)
+        root["user_dates"].extend(child.get("user_dates") or [])
+        root["steps"].extend(child.get("steps") or [])
+        for ws in child.get("workspaces") or []:
+            if ws not in root["workspaces"]:
+                root["workspaces"].append(ws)
+        if child.get("mtime", 0) > root.get("mtime", 0):
+            root["mtime"] = child["mtime"]
+        if child.get("last_dt") and (not root.get("last_dt") or child["last_dt"] > root["last_dt"]):
+            root["last_dt"] = child["last_dt"]
+        if child.get("first_dt") and (not root.get("first_dt") or child["first_dt"] < root["first_dt"]):
+            root["first_dt"] = child["first_dt"]
+
+        for m_name, mb in (child.get("by_model") or {}).items():
+            rm = root["by_model"].setdefault(
+                m_name,
+                {"turns": 0, "input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+            )
+            rm["turns"] += int(mb.get("turns") or 0)
+            rm["input_tokens"] += int(mb.get("input_tokens") or 0)
+            rm["cache_read_tokens"] += int(mb.get("cache_read_tokens") or 0)
+            rm["output_tokens"] += int(mb.get("output_tokens") or 0)
+            rm["cost_usd"] += float(mb.get("cost_usd") or 0.0)
+
+        for m_name, tmb in (child.get("timing_by_model") or {}).items():
+            rtm = root["timing_by_model"].setdefault(m_name, {"out": 0, "elapsed": 0.0})
+            rtm["out"] = int(rtm.get("out") or 0) + int(tmb.get("out") or 0)
+            rtm["elapsed"] = float(rtm.get("elapsed") or 0.0) + float(tmb.get("elapsed") or 0.0)
+
+        c_out = int(child.get("cum_out") or 0)
+        c_el = float(child.get("cum_elapsed") or 0.0)
+        if c_out > 0 and c_el > 0:
+            root["cum_out"] = int(root.get("cum_out") or 0) + c_out
+            root["cum_elapsed"] = float(root.get("cum_elapsed") or 0.0) + c_el
+            root["cum_tps"] = round(root["cum_out"] / root["cum_elapsed"], 2)
+
+    result = list(folded.values())
+    result.sort(key=lambda s: s["mtime"], reverse=True)
+    return result
+
+
 def match_workspace(session_workspaces: list[str], target: str, recursive: bool) -> bool:
     for ws in session_workspaces:
         if ws == target:
@@ -240,6 +324,8 @@ def show_session_detail(sess: dict) -> None:
     print(f"=== 会话明细: {sid} ===")
     if sess["title"]:
         print(f"标题: {clean_cell(sess['title'])}")
+    if sess.get("subagent_count", 0) > 0:
+        print(f"子代理: {sess['subagent_count']} 个 (已合并计入以下统计)")
     print(f"工作区: {ws_str}")
     print(f"日志: {sess['path']}")
     print()
@@ -315,10 +401,12 @@ def main() -> None:
     parser.add_argument("--json", action="store_true", help="输出 JSON 格式")
     args = parser.parse_args()
 
-    all_sessions = load_all_sessions()
-    if not all_sessions:
+    raw_sessions = load_all_sessions()
+    if not raw_sessions:
         print("未找到任何本地 agy 会话记录 (~/.gemini/antigravity-cli/brain/)。")
         return
+
+    all_sessions = fold_subagent_sessions(raw_sessions)
 
     target_ws = ""
     sessions = all_sessions
@@ -340,6 +428,8 @@ def main() -> None:
 
     if args.session:
         matches = [s for s in sessions if s["session_id"].startswith(args.session)]
+        if not matches:
+            matches = [s for s in raw_sessions if s["session_id"].startswith(args.session)]
         if not matches:
             print(f"未找到前缀为 '{args.session}' 的会话。", file=sys.stderr)
             sys.exit(1)
@@ -464,6 +554,7 @@ def main() -> None:
                     "output_tokens": s["output_tokens"],
                     "est_cost_usd": round(float(s.get("est_cost_usd") or 0.0), 4),
                     "cum_tps": s.get("cum_tps"),
+                    "subagent_count": int(s.get("subagent_count") or 0),
                 }
                 for s in sessions
             ],
@@ -541,7 +632,9 @@ def main() -> None:
         spd = f"{s['cum_tps']:.1f}/s" if s.get("cum_tps") is not None else "--"
         ws_short = Path(s["workspaces"][0]).name if s["workspaces"] else "-"
         title = s["title"] or "(无标题)"
-        desc = f"[{ws_short}] {title}" if not target_ws else title
+        sub_n = int(s.get("subagent_count") or 0)
+        sub_tag = f"(+{sub_n}子) " if sub_n > 0 else ""
+        desc = f"[{ws_short}] {sub_tag}{title}" if not target_ws else f"{sub_tag}{title}"
         sess_rows.append(
             [
                 s["session_id"][:8],

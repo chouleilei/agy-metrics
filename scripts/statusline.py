@@ -27,6 +27,7 @@ from agy_metrics_lib import (
     fmt_tokens,
     fmt_usd,
     load_json_safe,
+    read_subagent_aggregates,
     read_transcript_incremental,
     safe_id,
     session_lock,
@@ -229,10 +230,19 @@ def main() -> None:
     sess_cache_read = int(t_stats.get("cache_read_tokens") or 0)
     sess_out = int(t_stats.get("output_tokens") or 0)
 
-    display_in = (sess_in_uncached + sess_cache_read) if t_stats else total_in
-    display_out = sess_out if (t_stats and sess_out > 0) else total_out
+    sub_agg = read_subagent_aggregates(session_id) if session_id else {}
+    sub_count = int(sub_agg.get("sub_count") or 0)
+    agg_steps = llm_steps + int(sub_agg.get("turns") or 0)
+    agg_in_uncached = sess_in_uncached + int(sub_agg.get("input_tokens") or 0)
+    agg_cache_read = sess_cache_read + int(sub_agg.get("cache_read_tokens") or 0)
+    agg_out = sess_out + int(sub_agg.get("output_tokens") or 0)
+    sub_cost_usd = float(sub_agg.get("est_cost_usd") or 0.0)
 
-    sess_cache_pct = calc_cache_rate(sess_in_uncached, sess_cache_read) if t_stats else None
+    has_local = bool(t_stats) or sub_count > 0
+    display_in = (agg_in_uncached + agg_cache_read) if has_local else total_in
+    display_out = agg_out if (has_local and agg_out > 0) else total_out
+
+    sess_cache_pct = calc_cache_rate(agg_in_uncached, agg_cache_read) if has_local else None
     cur_cache_pct = None
     if isinstance(cur, dict) and cur:
         cur_cache_pct = calc_cache_rate(
@@ -246,7 +256,8 @@ def main() -> None:
 
     parts = [f"Ctx {color_pct(used_pct)}"]
 
-    turn_step_tag = f"({user_turns}轮{llm_steps}步)" if (user_turns or llm_steps) else ""
+    sub_tag = f"+{sub_count}子代理" if sub_count > 0 else ""
+    turn_step_tag = f"({user_turns}轮{agg_steps}步{sub_tag})" if (user_turns or agg_steps) else ""
     parts.append(
         f"会话{turn_step_tag} {BLUE}In:{fmt_tokens(display_in)}{RESET} {MAGENTA}Out:{fmt_tokens(display_out)}{RESET}"
     )
@@ -286,9 +297,9 @@ def main() -> None:
             official_usd = cost.get("total_cost_usd")
 
     if isinstance(official_usd, (int, float)) and official_usd > 0:
-        display_usd = float(official_usd)
+        display_usd = float(official_usd) + sub_cost_usd
     else:
-        display_usd = float(t_stats.get("est_cost_usd") or 0.0) if t_stats else 0.0
+        display_usd = (float(t_stats.get("est_cost_usd") or 0.0) if t_stats else 0.0) + sub_cost_usd
         if display_usd <= 0 and isinstance(cur, dict) and cur:
             display_usd = calc_step_cost_usd(
                 model_key,
